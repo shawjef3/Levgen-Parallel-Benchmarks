@@ -7,8 +7,9 @@ import Random.Xorshift
 import Control.Monad
 import Control.Monad.Random
 import Control.Concurrent
-import Control.Concurrent.MVar
 import Control.DeepSeq
+import Control.Concurrent.Chan
+import Control.Monad.Trans.Class
 
 type Pos = (Int,Int)
 
@@ -39,13 +40,13 @@ maxWid = 8
 numLevs = 10
 numTries = 50000
 
-getRandomPos :: Rand Xorshift Int
+getRandomPos :: Monad m => RandT Xorshift m Int
 getRandomPos = do
   r <- getRandom
   let rPos = abs r
   rPos `seq` return rPos
 
-genRoom :: Rand Xorshift Room
+genRoom :: Monad m => RandT Xorshift m Room
 genRoom = do
     r1 <- getRandomPos
     r2 <- getRandomPos
@@ -57,16 +58,7 @@ genRoom = do
     let h = rem r4 maxWid + minWid
     return Room {rx = x, ry = y, rw = w, rh = h} 
 
-genGoodRooms :: Int -> Rand Xorshift (V.Vector Room)
-genGoodRooms n = aux n V.empty
-    where aux 0 accum = return accum
-          aux count accum = do
-            room <- genRoom
-            if goodRoom accum room
-                then aux (count-1) (V.cons room accum)
-                else aux count accum
-
-genGoodRooms' :: Int -> Int -> Rand Xorshift (V.Vector Room)
+genGoodRooms' :: Monad m => Int -> Int -> RandT Xorshift m (V.Vector Room)
 genGoodRooms' n t = aux n t V.empty
     where aux 0 _ accum = return accum
           aux _ 0 accum = return accum
@@ -103,7 +95,7 @@ showTiles = unlines . chunksOf levDim . map toChar
   where toChar Wall = '0'
         toChar Space = '1'
 
-genLevel :: Rand Xorshift Lev
+genLevel :: Monad m => RandT Xorshift m Lev
 genLevel = do
     rooms <- genGoodRooms' 100 numTries
     let tiles = map (toTile rooms) [1 .. levDim ^ 2]
@@ -112,18 +104,21 @@ genLevel = do
     toTile rooms n = if (V.any (toPos n `inRoom`) rooms) then Space else Wall
     toPos n = let (y, x) = quotRem n levDim in (x, y)
 
-genLevelMVar :: Int -> IO (MVar Lev)
-genLevelMVar seed =
-    let gen = makeXorshift seed in
-    do levelVar <- newEmptyMVar
-       forkIO (let level = evalRand genLevel gen in level `deepseq` putMVar levelVar level)
-       return levelVar
+genLevelChan :: Chan Lev -> RandT Xorshift IO ()
+genLevelChan chan =
+    do level <- genLevel
+       level `deepseq` lift (writeChan chan level)
 
-genLevels :: [Int] -> IO [MVar Lev]
-genLevels = mapM genLevelMVar
+genLevels :: Chan Lev -> RandT Xorshift IO ()
+genLevels = forever . genLevelChan
 
 biggestLev :: [Lev] -> Lev
 biggestLev = L.maximumBy (comparing (V.length . lRooms))
+
+readChanN :: Chan a -> Int -> IO [a]
+readChanN chan n = do
+  chanContents <- getChanContents chan
+  return $ take n chanContents
 
 main :: IO ()
 main = do
@@ -132,7 +127,10 @@ main = do
     putStrLn v
     let levelCount = numLevs
     let gen = makeXorshift (read v)
-    let (rand,_) = next gen
-    levels <- genLevels [rand .. rand+levelCount]
-    levels <- mapM readMVar levels
+    let rand = fst $ next gen
+    numCapabilities <- getNumCapabilities
+    let gens = map makeXorshift [rand .. rand+numCapabilities-1]
+    levelChan <- newChan
+    mapM_ (forkIO . evalRandT (genLevels levelChan)) gens
+    levels <- readChanN levelChan levelCount
     putStr $ showTiles $ lTiles $ biggestLev levels
